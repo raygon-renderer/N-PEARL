@@ -28,4 +28,4 @@ compact quantized blob.
 Documentation
 -------------
 
-The crate docs carry the full design and math (rendered with KaTeX).
+See [https://raygon-renderer.github.io/N-PEARL/](https://raygon-renderer.github.io/N-PEARL/) for the full docs with KaTeX enabled.
