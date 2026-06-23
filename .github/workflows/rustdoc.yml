@@ -41,7 +41,7 @@ jobs:
                   RUSTDOCFLAGS: "${{ env.RUSTDOCFLAGS }} --html-after-content doc-footer.html --html-in-header ${{ github.workspace }}/katex-header.html"
 
             - run: |
-                  echo "<meta http-equiv=refresh content=0;url=`echo $GITHUB_REPOSITORY | cut -d '/' -f 2 | tr '[:upper:]' '[:lower:]'`/index.html>" > target/doc/index.html
+                  echo "<meta http-equiv=refresh content=0;url=`echo $GITHUB_REPOSITORY | cut -d '/' -f 2 | tr '[:upper:]' '[:lower:]' | tr '-' '_'`/index.html>" > target/doc/index.html
                   touch target/doc/.nojekyll
 
             - name: Upload artifact
