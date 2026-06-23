@@ -1,0 +1,15 @@
+[package]
+name = "n-pearl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thermite = { git = "https://github.com/raygon-renderer/thermite" }
+thermite-special = { git = "https://github.com/raygon-renderer/thermite" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+plotly = "0.14"
+criterion = "0.8"
