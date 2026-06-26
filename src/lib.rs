@@ -57,9 +57,13 @@
 //! Weight layout: each linear is stored column-major w.r.t. `(out, in)` - column `i` (an `out`-long
 //! vector) is contiguous, so the matvec broadcasts `x[i]` and FMAs the contiguous column.
 
+pub mod cube;
 pub mod fluor;
 
+use core::mem::MaybeUninit;
+
 use thermite::prelude::*;
+use thermite::simd::SimdExperimentalVectors;
 
 use thermite::math::RealMath;
 use thermite_special::SpecialMath;
@@ -67,8 +71,54 @@ use thermite_special::SpecialMath;
 pub trait NnVector: SwizzleVector + RealMath + SpecialMath<Element = f32> {}
 impl<V> NnVector for V where V: SwizzleVector + RealMath + SpecialMath<Element = f32> {}
 
-pub trait NnBackend: SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector> {}
-impl<S> NnBackend for S where S: SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector> {}
+pub trait NnBackend:
+    SimdVectorsWithRegisters
+    + SimdExperimentalVectors
+    + SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector>
+{
+}
+impl<S> NnBackend for S where
+    S: SimdVectorsWithRegisters
+        + SimdExperimentalVectors
+        + SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector>
+{
+}
+
+/// View an initialized prefix of a `MaybeUninit<f32>` buffer as `&[f32]` (stable stand-in for the unstable
+/// `MaybeUninit::slice_assume_init_ref`). `MaybeUninit<f32>` is layout-identical to `f32`.
+///
+/// # Safety
+/// Every element of `s` must be initialized.
+#[inline(always)]
+pub(crate) unsafe fn slice_assume_init_ref(s: &[MaybeUninit<f32>]) -> &[f32] {
+    // SAFETY: caller guarantees all elements are initialized; the cast preserves length and layout.
+    unsafe { &*(s as *const [MaybeUninit<f32>] as *const [f32]) }
+}
+
+/// Decode an IEEE-754 binary16 (half) to f32 (dependency-free). Values are always finite and in range, so
+/// the only split is normal vs subnormal; the inf/NaN case is dropped (a `debug_assert` catches it).
+///
+/// Both paths are FP-free bit re-packs (the subnormal one needs a single multiply): the layouts differ only
+/// by mantissa width (`$10 \to 23$` bits, a left shift of 13) and exponent bias (`$15 \to 127$`, i.e.
+/// `$+112$`), with the sign bit moved from bit 15 to bit 31.
+#[inline]
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
+    let h = h as u32;
+    let sign = (h & 0x8000) << 16; // bit 15 -> bit 31
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    debug_assert!(exp != 0x1f, "f16_to_f32: inf/NaN half {h:#06x}");
+
+    if exp == 0 {
+        // Zero or subnormal: value = mant * 2^-24, exactly representable as a (sub)normal f32.
+        // mant == 0 yields a signed zero for free. `0x3380_0000` is the bit pattern of 2^-24.
+        let mag = mant as f32 * f32::from_bits(0x3380_0000);
+        return f32::from_bits(mag.to_bits() | sign);
+    }
+
+    // Normal (exp in 1..=30): rebias the exponent 15 -> 127 (+112) and widen the mantissa 10 -> 23 bits.
+    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+}
 
 // ============================================================================
 // Hard-coded architecture + reconstruction constants (specific to the shipped network)
@@ -164,8 +214,21 @@ fn xyz_to_lab_e(xyz: [f32; 3]) -> [f32; 3] {
 /// Algebraic SiLU on a vector: `$a\,(0.5 + 0.5\,a\,(1 + a^2)^{-1/2})$`.
 #[inline(always)]
 fn alg_silu_v<V: NnVector>(a: V) -> V {
-    let g = a * a.mul_adde(a, V::ONE).inverse_sqrt(); // a * (1 + a^2)^(-1/2)
-    a * g.mul_adde(V::HALF, V::HALF)
+    let x = a.mul_adde(a, V::ONE);
+
+    if const { V::HAS_APPROX_RSQRT } {
+        let y = x.rsqrt();
+
+        // Newton factor for 1/sqrt(x), 0.5 folded into the constants:
+        //   nf = 0.75 - 0.25*x*y^2,  so (a*y)*nf ≈ 0.5*a/sqrt(x)
+        let nf = y.square().mul_adde(x.scale(-0.25), V::splat(0.75));
+
+        // silu = 0.5*a + 0.5*a^2/sqrt(x) = a*(a*y*nf + 0.5)
+        a * (a * y).mul_adde(nf, V::HALF)
+    } else {
+        let g = a / x.sqrt(); // a * (1 + a^2)^(-1/2)
+        a * g.mul_adde(V::HALF, V::HALF)
+    }
 }
 
 /// Bound the trailing 8 reconstruction outputs in one SIMD pass over a native `V` (assumed 8-wide). The
@@ -233,13 +296,12 @@ fn bound_outputs<V: NnVector<Lanes = thermite::generic_array::typenum::U8>>(o: &
     //   inv  = base^(-1/2) = inverse_sqrt(base)
     //   d    = inv  (p=2)  |  sqrt(inv) = base^(-1/4)  (p=4)
     let x2 = x * x;
-    let base = is_p4.select(x2.mul_adde(x2, V::ONE), x2 + V::ONE);
+    let base = is_p4.select(x2 * x2, x2) + V::ONE;
     let inv = base.inverse_sqrt();
     let d = is_p4.select(inv.sqrt(), inv);
-    let core = x * d;
 
     // out = A + B*core
-    core.mul_adde(b, a).into_array().into_array()
+    d.mul_adde(b * x, a).into_array().into_array()
 }
 
 /// Output-stationary `y = act?(W*x + b)`. `w` is column-major `(OUT, IN)`: column `i` at
@@ -263,7 +325,7 @@ fn matvec_act<V: NnVector, const ACT: bool, const IN: usize, const OUT: usize, c
     w: &[f32],
     b: &[f32],
     x: &[f32],
-    y: &mut [f32],
+    y: &mut [MaybeUninit<f32>],
 ) {
     let lanes = V::LANES;
     debug_assert_eq!(NCH * lanes, OUT, "NCH * V::LANES must equal OUT");
@@ -312,14 +374,16 @@ fn matvec_act<V: NnVector, const ACT: bool, const IN: usize, const OUT: usize, c
             out = alg_silu_v(acc[j][0])
         };
 
-        // SAFETY: j < NCH so j*lanes + lanes <= OUT <= len(y).
-        unsafe { out.store_unaligned(y.as_mut_ptr().add(j * lanes)) };
+        // SAFETY: j < NCH so j*lanes + lanes <= OUT <= len(y). Storing through the MaybeUninit
+        // backing as *mut f32 initializes lanes [j*lanes, j*lanes+lanes); across all j the loop writes
+        // every slot of y[..OUT], so the caller may assume_init that prefix afterwards.
+        unsafe { out.store_unaligned(y.as_mut_ptr().add(j * lanes).cast::<f32>()) };
         j += 1;
     }
 }
 
 // ============================================================================
-// QNN1 quantized-weight decoder (dependency-free)
+// QNN quantized-weight decoder (dependency-free)
 // ============================================================================
 
 /// Max unary run before the Golomb-Rice escape (a raw 32-bit value follows). Must match the encoder.
@@ -344,23 +408,6 @@ const N_BIAS: usize = {
 #[inline]
 fn unzigzag(z: u32) -> i32 {
     ((z >> 1) as i32) ^ -((z & 1) as i32)
-}
-
-/// Decode an IEEE-754 binary16 (half) to f32 (dependency-free). The weight blob stores per-channel scales and
-/// biases as halves; subnormals occur (the smallest-step / most-sensitive channels), so handle them.
-#[inline]
-fn f16_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let mant = (h & 0x3ff) as f32;
-    let mag = if exp == 0 {
-        mant * 2f32.powi(-24) // subnormal: mant * 2^-10 * 2^-14
-    } else if exp == 0x1f {
-        if mant == 0.0 { f32::INFINITY } else { f32::NAN }
-    } else {
-        (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
-    };
-    sign * mag
 }
 
 struct BitReader<'a> {
@@ -441,7 +488,7 @@ pub struct UpliftParams {
 }
 
 impl DeployNet {
-    /// Decode the embedded compressed weight blob (`model/deploy.qnn1`) into the column-major layer
+    /// Decode the embedded compressed weight blob (`model/deploy.qnn`) into the column-major layer
     /// buffers. The weights are post-training quantized and Golomb-Rice coded; the quantization is
     /// optimized against the appearance metric (CIELAB under D65 / dE2000) rather than raw reflectance,
     /// since perceptually identical metamers can differ in weight-space. Dependency-free: one linear pass
@@ -554,7 +601,7 @@ impl DeployNet {
         &self,
         color_xyz: [f32; 3],
         white_ab: [f32; 2],
-        out: &mut [f32],
+        out: &mut [MaybeUninit<f32>],
     ) {
         let v = V::new([color_xyz[0], color_xyz[1], color_xyz[2], 0.0]); // lane 3 unused (w = 0)
         let big = v.cmp_gt(V::splat(LAB_EPS));
@@ -577,17 +624,18 @@ impl DeployNet {
 
         // Standardize (raw - mean)/std = raw*inv_std - mean*inv_std (whit_std holds inv_std, whit_mean the
         // premultiplied mean). Written directly -- no `raw` array, no loop.
+        // Writes out[0..N_IN] in full (the caller assume_inits exactly that prefix).
         let (m, s) = (&self.whit_mean, &self.whit_std);
-        out[0] = lab_l.mul_sube(s[0], m[0]);
-        out[1] = lab_a.mul_sube(s[1], m[1]);
-        out[2] = lab_b.mul_sube(s[2], m[2]);
-        out[3] = white_ab[0].mul_sube(s[3], m[3]);
-        out[4] = white_ab[1].mul_sube(s[4], m[4]);
-        out[5] = c2.mul_sube(s[5], m[5]);
+        out[0].write(lab_l.mul_sube(s[0], m[0]));
+        out[1].write(lab_a.mul_sube(s[1], m[1]));
+        out[2].write(lab_b.mul_sube(s[2], m[2]));
+        out[3].write(white_ab[0].mul_sube(s[3], m[3]));
+        out[4].write(white_ab[1].mul_sube(s[4], m[4]));
+        out[5].write(c2.mul_sube(s[5], m[5]));
     }
 
     /// E-referenced CIELAB `(a, b)` of an illuminant white XYZ, for [`Self::uplift`]. Compute once per
-    /// illuminant (not per material) -- scalar cbrt is fine here since it is off the hot path.
+    /// illuminant (not per material).
     #[inline]
     pub fn white_lab_ab(white_xyz: [f32; 3]) -> [f32; 2] {
         let lab = xyz_to_lab_e(white_xyz);
@@ -595,18 +643,30 @@ impl DeployNet {
     }
 }
 
-#[thermite::dispatch(S)]
+type F32x4<S> = <S as SimdVectors>::f32x4;
+type F32x8<S> = <S as SimdVectors>::f32x8;
+type F32x16<S> = <S as SimdVectors>::f32x16;
+
 impl DeployNet {
-    /// Run the MLP and bound the outputs. `S` selects the native vector width for the matvec FMA loops.
-    /// `white_ab` is the illuminant white's E-referenced CIELAB `(a, b)` from [`Self::white_lab_ab`]
-    /// (precompute once per illuminant).
-    pub fn uplift<S: NnBackend>(&self, color_xyz: [f32; 3], white_ab: [f32; 2]) -> UpliftParams {
+    /// MLP forward pass -> the 16 raw network outputs (pre-bounding). Shared by the dispatched entry
+    /// points [`Self::uplift`] / [`Self::uplift_raw`]; `#[inline(always)]` so it folds into their
+    /// `#[target_feature]` bodies and the matvec FMAs use the dispatched ISA.
+    #[inline(always)]
+    fn forward<S: NnBackend>(&self, color_xyz: [f32; 3], white_ab: [f32; 2]) -> [f32; N_OUT] {
         // Double-width scratch split into two halves; each layer reads `src`, writes `dst`, then swaps the
         // two &mut references (pointer swap, no copy). After N_LAYERS (=7, odd) swaps the output is in `src`.
-        let mut scratch: [f32; 2 * MAX_W] = unsafe { core::mem::zeroed() };
+        //
+        // Left uninitialized (no per-call zeroing memset): every slot is written before it is read.
+        // `input_features` writes `src[..N_IN]`; then layer L reads only `src[..DIMS[L]]` (fully written by
+        // layer L-1, or by input_features for L=0) and writes all of `dst[..DIMS[L+1]]`, seeding its
+        // accumulators from `b` rather than from `dst`. So we hand each writer a `&mut [MaybeUninit<f32>]`
+        // target and only ever form a `&[f32]` read-view over the prefix that was just initialized.
+        let mut scratch: [MaybeUninit<f32>; 2 * MAX_W] = [const { MaybeUninit::uninit() }; 2 * MAX_W];
         let (mut src, mut dst) = scratch.split_at_mut(MAX_W);
 
-        self.input_features::<S::f32x4>(color_xyz, white_ab, &mut src[..N_IN]);
+        self.input_features::<F32x4<S>>(color_xyz, white_ab, &mut src[..N_IN]);
+        // SAFETY: input_features wrote all of src[..N_IN]; that prefix is now initialized.
+        let mut src_len = N_IN;
 
         // Layers unrolled with const dims (single source of truth = DIMS) so each matvec monomorphizes to
         // a fixed shape, over f32x16 (double-pumped AVX2). NCH = OUT/16 output chunks held live for ILP.
@@ -617,13 +677,19 @@ impl DeployNet {
                 // Target ~4 f32x16 accumulators (~8 ymm) for full ILP: split the input reduction only when
                 // NCH alone gives too few chains. NCH>=3 already saturates, so SPLIT=1 (no-op) there.
                 const SPLIT: usize = if NCH >= 3 { 1 } else { 4 / NCH };
-                matvec_act::<S::f32x16, $act, { DIMS[$l] }, { DIMS[$l + 1] }, NCH, SPLIT>(
+                debug_assert_eq!(src_len, DIMS[$l], "src prefix length must equal this layer's IN");
+                // SAFETY: src[..DIMS[$l]] was fully written by the previous writer (input_features for
+                // l=0, the prior layer otherwise), tracked by `src_len`.
+                let xin: &[f32] = unsafe { slice_assume_init_ref(&src[..DIMS[$l]]) };
+                matvec_act::<F32x16<S>, $act, { DIMS[$l] }, { DIMS[$l + 1] }, NCH, SPLIT>(
                     &self.w[$l],
                     &self.b[$l],
-                    &src[..DIMS[$l]],
+                    xin,
                     &mut dst[..DIMS[$l + 1]],
                 );
+                // dst[..DIMS[$l+1]] is now fully initialized; after the swap it becomes the new src prefix.
                 core::mem::swap(&mut src, &mut dst);
+                src_len = DIMS[$l + 1];
             }};
         }
         layer!(0, true);
@@ -634,20 +700,47 @@ impl DeployNet {
         layer!(5, true);
         layer!(6, false); // last layer: bare linear readout
 
-        let o = &src[..N_OUT];
+        debug_assert_eq!(src_len, N_OUT, "final src prefix length must equal N_OUT");
+        let mut out = [0.0f32; N_OUT];
+        // SAFETY: the last layer wrote all of src[..N_OUT] (DIMS[N_LAYERS] = N_OUT).
+        out.copy_from_slice(unsafe { slice_assume_init_ref(&src[..N_OUT]) });
+        out
+    }
+}
 
-        // res.x peeled to scalar (cheapest lane: alg_tanh, no bias/remap); the other 8
-        // [y, alpha, beta, scale, c, le, s, r] bounded in one masked SIMD pass.
+#[thermite::dispatch(S)]
+impl DeployNet {
+    /// Run the MLP and bound the outputs into reconstruction parameters. `S` selects the native vector
+    /// width for the matvec FMA loops. `white_ab` is the illuminant white's E-referenced CIELAB `(a, b)`
+    /// from [`Self::white_lab_ab`] (precompute once per illuminant).
+    pub fn uplift<S: NnBackend>(&self, color_xyz: [f32; 3], white_ab: [f32; 2]) -> UpliftParams {
+        UpliftParams::from_outputs::<S>(&self.forward::<S>(color_xyz, white_ab))
+    }
+
+    /// The 16 raw network outputs (pre-bounding), for baking a [`crate::cube::LookupCube`] -- the same
+    /// forward as [`Self::uplift`] without the final bound/precompute step.
+    pub fn uplift_raw<S: NnBackend>(&self, color_xyz: [f32; 3], white_ab: [f32; 2]) -> [f32; N_OUT] {
+        self.forward::<S>(color_xyz, white_ab)
+    }
+}
+
+impl UpliftParams {
+    /// Bound + precompute the reconstruction parameters from the network's 16 raw outputs (slot order
+    /// `[coeffs(7) | res x,y,alpha,beta(4) | scale | c, lambda_e, s | r]`). Shared by the live MLP path
+    /// ([`DeployNet::uplift`]) and the [`crate::cube`] lookup. `res.x` is peeled to a scalar `alg_tanh`
+    /// (cheapest lane: no bias/remap); the other 8 bounds run in one masked SIMD pass.
+    #[inline]
+    pub(crate) fn from_outputs<S: NnBackend>(o: &[f32]) -> Self {
         let res_x = RES_X_MAX * alg_tanh(o[O_RES]);
-        let bnd = bound_outputs::<S::f32x8>(o);
+        let bnd = bound_outputs::<F32x8<S>>(o);
         let (y, alpha, beta, scale) = (bnd[0], bnd[1], bnd[2], bnd[3]);
 
         let mut coeffs = [0.0f32; CHEB_K + 1];
         coeffs.copy_from_slice(&o[O_COEFFS..O_COEFFS + CHEB_K + 1]);
 
-        // Precompute the lambda-independent reflectance constants (hoisted out of the per-eval hot path).
+        // lambda-independent reflectance constants, hoisted out of the per-eval hot path.
         let yy = y * y;
-        UpliftParams {
+        Self {
             coeffs,
             res_x,
             res_yy: yy,
@@ -661,9 +754,7 @@ impl DeployNet {
             r: bnd[7],
         }
     }
-}
 
-impl UpliftParams {
     /// Base reflectance `$\rho(\lambda)$` in `[leak, 1-leak] * scale`, vectorized over the wavelength
     /// vector `V` (the hot path): linear-mapped Chebyshev (deg-6) + one Lorentzian resonance, through
     /// the sharp algebraic sigmoid. `lambda` in nm. Does not include fluorescence (that is the renderer's

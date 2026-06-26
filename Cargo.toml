@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-thermite = { git = "https://github.com/raygon-renderer/thermite" }
-thermite-special = { git = "https://github.com/raygon-renderer/thermite" }
+thermite = { git = "https://github.com/raygon-renderer/thermite", default-features = false, features = ["avx2-f16c"] }
+thermite-special = { git = "https://github.com/raygon-renderer/thermite", default-features = false }
 
 [dev-dependencies]
 plotly = "0.14"
 criterion = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
