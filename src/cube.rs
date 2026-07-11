@@ -33,11 +33,10 @@ use core::array::from_fn;
 
 use thermite::element::float::spec::Fp16Fast;
 use thermite::prelude::*;
-use thermite::simd::SimdExperimentalVectors;
 
 use crate::{NnBackend, NnVector, UpliftParams};
 
-type U16x16<B> = <B as SimdExperimentalVectors>::u16x16;
+type U16x16<B> = <B as SimdVectors>::u16x16;
 type F32x16<B> = <B as SimdVectors>::f32x16;
 
 /// How a [`LookupCube`] stores each node's 16 network outputs in memory: the per-node `Storage` type and

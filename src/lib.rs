@@ -63,7 +63,6 @@ pub mod fluor;
 use core::mem::MaybeUninit;
 
 use thermite::prelude::*;
-use thermite::simd::SimdExperimentalVectors;
 
 use thermite::math::RealMath;
 use thermite_special::SpecialMath;
@@ -72,15 +71,11 @@ pub trait NnVector: SwizzleVector + RealMath + SpecialMath<Element = f32> {}
 impl<V> NnVector for V where V: SwizzleVector + RealMath + SpecialMath<Element = f32> {}
 
 pub trait NnBackend:
-    SimdVectorsWithRegisters
-    + SimdExperimentalVectors
-    + SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector>
+    SimdVectorsWithRegisters + SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector>
 {
 }
 impl<S> NnBackend for S where
-    S: SimdVectorsWithRegisters
-        + SimdExperimentalVectors
-        + SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector>
+    S: SimdVectorsWithRegisters + SimdVectors<f32xN: NnVector, f32x4: NnVector, f32x8: NnVector, f32x16: NnVector>
 {
 }
 
